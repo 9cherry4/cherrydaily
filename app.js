@@ -38,7 +38,7 @@
     };
   });
   let schedules = readStorage(KEYS.schedules, {});
-  let settings = { dayStart: DEFAULT_DAY_START, dayEnd: DEFAULT_DAY_END, bufferMinutes: DEFAULT_BUFFER_MINUTES, effectiveFrom: localDate(), ...readStorage(KEYS.settings, {}) };
+  let settings = { dayStart: DEFAULT_DAY_START, dayEnd: DEFAULT_DAY_END, bufferMinutes: DEFAULT_BUFFER_MINUTES, effectiveFrom: localDate(), conditionMode: false, conditionLevel: 'normal', ...readStorage(KEYS.settings, {}) };
   let currentFilter = 'all';
   let currentTaskPeriod = 'all';
   let currentCompletedPeriod = 'all';
@@ -491,7 +491,7 @@
       : `${durationText(item.durationMinutes)} ${task?.splittable && item.type === 'task' ? '· 분할 업무' : ''}`;
     const badges = task ? `${task.importance === 'high' ? '<span class="badge high">중요</span>' : ''}${task.recurring ? `<span class="badge recurring">${escapeHTML(recurrenceSummary(task))}</span>` : ''}` : '';
     const actions = item.type === 'buffer' ? '' : item.completed ? `
-      <div class="schedule-actions"><span class="badge normal">완료됨</span></div>` : `
+      <div class="schedule-actions"><button class="icon-button" type="button" data-schedule-action="restore" data-id="${item.id}" title="완료 취소" aria-label="${escapeHTML(item.title)} 완료 취소">↶</button><span class="badge normal">완료됨</span></div>` : `
       <div class="schedule-actions">
         <button class="icon-button" type="button" data-schedule-action="edit" data-id="${item.id}" title="수정" aria-label="${escapeHTML(item.title)} 수정">✎</button>
         <button class="icon-button complete" type="button" data-schedule-action="complete" data-id="${item.id}" title="완료" aria-label="${escapeHTML(item.title)} 완료">✓</button>
@@ -503,6 +503,7 @@
       <div class="schedule-bar"></div>
       <div class="schedule-main"><h3>${escapeHTML(item.title)}</h3><p>${subtitle}${badges}</p></div>
       ${actions}
+      ${item.description ? `<div class="schedule-tooltip">${escapeHTML(item.description)}</div>` : ''}
     </article>`;
   }
 
@@ -653,7 +654,7 @@
     renderCustomCalendar();
     $('#repeatPanel').hidden = true;
     $('#startDate').value = localDate();
-    $('#deadline').value = '';
+    $('#deadline').value = localDate();
     setFixedStartControls(minutesToTime(dayStart()));
     $('#fixedTimePanel').hidden = true;
     $('#formTitle').textContent = '새 할 일';
@@ -793,6 +794,30 @@
     saveAll();
     renderAll();
     showToast(task.completed || isCompletedForDate(task, date) ? '멋져요. 할 일을 완료했어요!' : '이 일정 조각을 완료했어요.');
+  }
+
+  function restoreScheduleItem(id) {
+    const date = localDate();
+    const schedule = schedules[date];
+    const item = schedule?.items.find((entry) => entry.id === id);
+    const task = item?.taskId ? tasks.find((entry) => entry.id === item.taskId) : null;
+    if (!item || !task) return;
+    schedule.items.filter((entry) => entry.taskId === task.id).forEach((entry) => {
+      entry.completed = false;
+      delete entry.completedAt;
+    });
+    task.completionHistory = (task.completionHistory || []).filter((entry) => entry.date !== date);
+    if (task.recurring) {
+      task.dailyProgress ||= {};
+      task.dailyProgress[date] = 0;
+    } else {
+      task.completed = false;
+      task.completedAt = null;
+      task.completedMinutes = 0;
+    }
+    saveAll();
+    renderAll();
+    showToast('완료를 취소하고 미완료 일정으로 되돌렸어요.');
   }
 
   function finishTask(task, date = localDate()) {
@@ -950,6 +975,9 @@
     $('#recurrenceMonth').addEventListener('change', () => updateYearDayOptions());
     $('#calendarPrev').addEventListener('click', () => moveCalendar(-1));
     $('#calendarNext').addEventListener('click', () => moveCalendar(1));
+    $('#calendarMonthToggle').addEventListener('click', () => { $('#calendarJump').hidden = !$('#calendarJump').hidden; });
+    $('#calendarYearSelect').addEventListener('change', jumpCalendarToSelection);
+    $('#calendarMonthSelect').addEventListener('change', jumpCalendarToSelection);
     $('#customCalendarGrid').addEventListener('click', (event) => {
       const button = event.target.closest('[data-calendar-date]');
       if (button) toggleCustomDate(button.dataset.calendarDate);
@@ -960,6 +988,8 @@
     $('#workStartMinute').addEventListener('change', previewWorkTimeChange);
     $('#workEndHour').addEventListener('change', previewWorkTimeChange);
     $('#workEndMinute').addEventListener('change', previewWorkTimeChange);
+    $('#conditionMode').addEventListener('change', updateConditionControls);
+    $('#conditionLevel').addEventListener('change', updateConditionControls);
     $('#saveSettingsButton').addEventListener('click', saveSettingsFromForm);
     $('#historyPrev').addEventListener('click', () => moveHistory(-1));
     $('#historyNext').addEventListener('click', () => moveHistory(1));
@@ -985,6 +1015,7 @@
         if (item?.taskId) editTask(item.taskId);
       }
       if (button.dataset.scheduleAction === 'complete') completeScheduleItem(button.dataset.id);
+      if (button.dataset.scheduleAction === 'restore') restoreScheduleItem(button.dataset.id);
       if (button.dataset.scheduleAction === 'postpone') postponeTaskFromSchedule(button.dataset.id);
     });
 
@@ -1108,7 +1139,37 @@
   function renderSettings() {
     setTimeControls('workStart', dayStart());
     setTimeControls('workEnd', dayEnd());
+    $('#conditionMode').checked = Boolean(settings.conditionMode);
+    $('#conditionLevel').value = settings.conditionLevel || 'normal';
+    $('#conditionPanel').hidden = !settings.conditionMode;
     setBufferControls(bufferMinutes());
+    setBufferControlsDisabled(Boolean(settings.conditionMode));
+    if (settings.conditionMode) updateConditionControls();
+  }
+
+  function conditionRatio(level) {
+    return { good: 0.1, normal: 0.2, tired: 0.3, pms: 0.25 }[level] ?? 0.2;
+  }
+
+  function automaticBufferFor(dayLength, conditionEnabled = $('#conditionMode').checked, level = $('#conditionLevel').value) {
+    const ratio = conditionEnabled ? conditionRatio(level) : 0.2;
+    return Math.round((dayLength * ratio) / TIME_STEP) * TIME_STEP;
+  }
+
+  function setBufferControlsDisabled(disabled) {
+    $('#bufferHours').disabled = disabled;
+    $('#bufferMinutes').disabled = disabled;
+  }
+
+  function updateConditionControls() {
+    const enabled = $('#conditionMode').checked;
+    $('#conditionPanel').hidden = !enabled;
+    setBufferControlsDisabled(enabled);
+    const start = getTimeControls('workStart');
+    const end = getTimeControls('workEnd');
+    if (end > start) setBufferControls(automaticBufferFor(end - start, enabled, $('#conditionLevel').value));
+    const modeLabel = enabled ? $('#conditionLevel').options[$('#conditionLevel').selectedIndex].text.split(' · ')[0] : '수동';
+    $('#bufferSettingSummary').textContent = `${modeLabel} 모드 · 여유 시간 ${durationText(selectedBufferMinutes())}`;
   }
 
   function previewWorkTimeChange() {
@@ -1118,11 +1179,11 @@
       $('#bufferSettingSummary').textContent = '종료 시간은 시작 시간보다 늦어야 합니다.';
       return;
     }
-    const automaticBuffer = Math.round(((end - start) * 0.2) / TIME_STEP) * TIME_STEP;
+    const automaticBuffer = automaticBufferFor(end - start);
     const hours = Math.floor(automaticBuffer / 60);
     $('#bufferHours').value = String(Math.min(13, hours));
     $('#bufferMinutes').value = String(automaticBuffer % 60);
-    $('#bufferSettingSummary').textContent = `일과 시간 변경에 맞춰 여유 시간 ${durationText(automaticBuffer)}으로 자동 조정`;
+    $('#bufferSettingSummary').textContent = `일과 시간과 컨디션에 맞춰 여유 시간 ${durationText(automaticBuffer)}으로 자동 조정`;
   }
 
   function applySettingsText() {
@@ -1151,6 +1212,8 @@
     settings.dayStart = newStart;
     settings.dayEnd = newEnd;
     settings.bufferMinutes = value;
+    settings.conditionMode = $('#conditionMode').checked;
+    settings.conditionLevel = $('#conditionLevel').value;
     settings.effectiveFrom = localDate();
     populateFixedStartHours();
     populateDurationHours();
@@ -1165,6 +1228,9 @@
   function populateRecurrenceControls() {
     $('#recurrenceMonthDay').innerHTML = Array.from({ length: 31 }, (_, index) => `<option value="${index + 1}">${index + 1}일</option>`).join('');
     $('#recurrenceMonth').innerHTML = Array.from({ length: 12 }, (_, index) => `<option value="${index + 1}">${index + 1}월</option>`).join('');
+    const currentYear = new Date().getFullYear();
+    $('#calendarYearSelect').innerHTML = Array.from({ length: 21 }, (_, index) => `<option value="${currentYear - 10 + index}">${currentYear - 10 + index}년</option>`).join('');
+    $('#calendarMonthSelect').innerHTML = Array.from({ length: 12 }, (_, index) => `<option value="${index}">${index + 1}월</option>`).join('');
     updateYearDayOptions();
   }
 
@@ -1228,11 +1294,19 @@
     renderCustomCalendar();
   }
 
+  function jumpCalendarToSelection() {
+    calendarCursor = new Date(Number($('#calendarYearSelect').value), Number($('#calendarMonthSelect').value), 1);
+    $('#calendarJump').hidden = true;
+    renderCustomCalendar();
+  }
+
   function renderCustomCalendar() {
     if (!$('#customCalendarGrid')) return;
     const year = calendarCursor.getFullYear();
     const month = calendarCursor.getMonth();
     $('#customCalendarTitle').textContent = `${year}년 ${month + 1}월`;
+    $('#calendarYearSelect').value = String(year);
+    $('#calendarMonthSelect').value = String(month);
     const firstDay = new Date(year, month, 1).getDay();
     const lastDate = new Date(year, month + 1, 0).getDate();
     const cells = Array.from({ length: firstDay }, () => '<span class="calendar-day-placeholder"></span>');
