@@ -5,6 +5,8 @@
   const DEFAULT_DAY_END = 21 * 60;
   const DEFAULT_DAY_MINUTES = DEFAULT_DAY_END - DEFAULT_DAY_START;
   const TIME_STEP = 15;
+  const SCHEDULE_ALGORITHM_VERSION = 2;
+  const IP_TIMEZONE_ENDPOINT = 'https://ipwho.is/';
   const DEFAULT_BUFFER_MINUTES = Math.round((DEFAULT_DAY_MINUTES * 0.2) / TIME_STEP) * TIME_STEP;
 
   const KEYS = {
@@ -43,11 +45,14 @@
   let currentTaskPeriod = 'all';
   let currentCompletedPeriod = 'all';
   let draggedScheduleId = null;
+  let selectedScheduleId = null;
   let toastTimer = null;
   let customRecurrenceDates = [];
   let calendarCursor = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
   let historyDate = addDays(localDate(), -1);
   let historyMode = 'day';
+  let currentTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Seoul';
+  let currentTimeZoneLabel = currentTimeZone;
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -96,6 +101,45 @@
     const month = String(date.getMonth() + 1).padStart(2, '0');
     const day = String(date.getDate()).padStart(2, '0');
     return `${year}-${month}-${day}`;
+  }
+
+  function zonedClock(date = new Date()) {
+    try {
+      const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+        timeZone: currentTimeZone,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+      }).formatToParts(date).filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
+      return {
+        date: `${parts.year}-${parts.month}-${parts.day}`,
+        minutes: Number(parts.hour) * 60 + Number(parts.minute),
+        label: `${parts.hour}:${parts.minute}`
+      };
+    } catch {
+      const hour = String(date.getHours()).padStart(2, '0');
+      const minute = String(date.getMinutes()).padStart(2, '0');
+      return { date: localDate(date), minutes: date.getHours() * 60 + date.getMinutes(), label: `${hour}:${minute}` };
+    }
+  }
+
+  async function resolveTimeZoneFromIp() {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 4000);
+      const response = await fetch(IP_TIMEZONE_ENDPOINT, { signal: controller.signal, cache: 'no-store' });
+      clearTimeout(timeout);
+      if (!response.ok) throw new Error('IP timezone lookup failed');
+      const data = await response.json();
+      const zone = typeof data.timezone === 'string' ? data.timezone : data.timezone?.id;
+      if (!data.success || !zone) throw new Error('IP timezone unavailable');
+      new Intl.DateTimeFormat('ko-KR', { timeZone: zone }).format(new Date());
+      currentTimeZone = zone;
+      currentTimeZoneLabel = [data.city, data.region, data.country].filter(Boolean).join(', ') || zone;
+    } catch {
+      currentTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Seoul';
+      currentTimeZoneLabel = currentTimeZone;
+    }
+    updateCurrentTimeMarker();
   }
 
   function addDays(dateString, amount) {
@@ -272,6 +316,10 @@
     };
   }
 
+  function isMovableScheduleItem(item) {
+    return Boolean(item) && !item.completed && (item.type === 'task' || item.type === 'buffer');
+  }
+
   function reserveBuffers(date, occupied, items, requestedMinutes = bufferMinutes()) {
     const bandsMap = timeBands();
     const bands = [bandsMap.morning, bandsMap.afternoon, bandsMap.evening];
@@ -332,6 +380,68 @@
     return reserved;
   }
 
+  function distributedTarget(rangeStart, rangeEnd, index, count, randomize = true) {
+    const spacing = (rangeEnd - rangeStart) / (count + 1);
+    const base = rangeStart + spacing * (index + 1);
+    const jitterLimit = Math.min(45, Math.floor((spacing * 0.28) / TIME_STEP) * TIME_STEP);
+    const jitterSteps = randomize && jitterLimit >= TIME_STEP ? Math.floor(jitterLimit / TIME_STEP) : 0;
+    const jitter = jitterSteps
+      ? (Math.floor(Math.random() * (jitterSteps * 2 + 1)) - jitterSteps) * TIME_STEP
+      : 0;
+    return Math.max(rangeStart, Math.min(rangeEnd, base + jitter));
+  }
+
+  function closestAvailableStart(occupied, rangeStart, rangeEnd, duration, target, minimumStart = rangeStart) {
+    const free = freeIntervals(occupied, Math.max(rangeStart, minimumStart), rangeEnd)
+      .filter((slot) => slot.end - slot.start >= duration);
+    let best = null;
+    for (const slot of free) {
+      const ideal = Math.round((target - duration / 2) / TIME_STEP) * TIME_STEP;
+      const start = Math.max(slot.start, Math.min(slot.end - duration, ideal));
+      const distance = Math.abs(start + duration / 2 - target);
+      if (!best || distance < best.distance) best = { start, distance };
+    }
+    return best?.start ?? null;
+  }
+
+  function buildPlacementPlans(flexibleTasks, date, availableMinutes) {
+    const plans = flexibleTasks.map((task) => ({
+      task,
+      total: remainingMinutes(task, date),
+      placed: 0,
+      units: []
+    }));
+    let budget = availableMinutes;
+
+    for (const plan of plans) {
+      if (!plan.task.splittable) {
+        if (plan.total <= budget) {
+          plan.units.push(plan.total);
+          budget -= plan.total;
+        }
+        continue;
+      }
+
+      let planned = 0;
+      while (planned < plan.total && budget >= TIME_STEP) {
+        const chunk = Math.min(60, plan.total - planned, Math.floor(budget / TIME_STEP) * TIME_STEP);
+        if (chunk < TIME_STEP) break;
+        plan.units.push(chunk);
+        planned += chunk;
+        budget -= chunk;
+      }
+    }
+
+    const queue = [];
+    const layers = Math.max(0, ...plans.map((plan) => plan.units.length));
+    for (let layer = 0; layer < layers; layer += 1) {
+      plans.forEach((plan) => {
+        if (plan.units[layer]) queue.push({ plan, duration: plan.units[layer] });
+      });
+    }
+    return { plans, queue };
+  }
+
   function generateSchedule(date = localDate(), preserveCompleted = true) {
     const previous = schedules[date]?.items || [];
     const preserved = preserveCompleted
@@ -343,7 +453,7 @@
     const candidates = tasks.filter((task) => isEligible(task, date));
 
     if (!candidates.length && !preserved.length) {
-      schedules[date] = { items: [], unscheduled: [], generatedAt: new Date().toISOString() };
+      schedules[date] = { items: [], unscheduled: [], algorithmVersion: SCHEDULE_ALGORITHM_VERSION, generatedAt: new Date().toISOString() };
       saveAll();
       return schedules[date];
     }
@@ -371,54 +481,41 @@
     }
 
     const reservedBuffer = reserveBuffers(date, occupied, items);
-    let flexibleBudget = Math.max(0, workLimit() - fixedMinutes);
+    const flexibleBudget = Math.max(0, workLimit() - fixedMinutes);
     const flexibleTasks = candidates
       .filter((task) => !task.isFixed)
       .sort((a, b) => priorityScore(b, date) - priorityScore(a, date) || (a.deadline || '9999-12-31').localeCompare(b.deadline || '9999-12-31') || a.createdAt.localeCompare(b.createdAt));
+    const { plans, queue } = buildPlacementPlans(flexibleTasks, date, flexibleBudget);
+    const bandsForDay = timeBands();
+    const groupTotals = queue.reduce((totals, unit) => {
+      const key = unit.plan.task.preferredTime || 'anytime';
+      totals[key] = (totals[key] || 0) + 1;
+      return totals;
+    }, {});
+    const groupIndexes = {};
 
-    for (const task of flexibleTasks) {
-      let remaining = remainingMinutes(task, date);
-      let placed = 0;
-      const bandsForDay = timeBands();
-      const [bandStart, bandEnd] = bandsForDay[task.preferredTime] || bandsForDay.anytime;
+    for (const unit of queue) {
+      const task = unit.plan.task;
+      const key = task.preferredTime || 'anytime';
+      const [bandStart, bandEnd] = bandsForDay[key] || bandsForDay.anytime;
+      const groupIndex = groupIndexes[key] || 0;
+      const target = distributedTarget(bandStart, bandEnd, groupIndex, groupTotals[key], true);
+      groupIndexes[key] = groupIndex + 1;
+      const start = closestAvailableStart(occupied, bandStart, bandEnd, unit.duration, target);
+      if (start === null) continue;
+      const item = makeScheduleItem(task, date, start, unit.duration);
+      items.push(item);
+      occupied.push({ start: item.start, end: item.end });
+      unit.plan.placed += unit.duration;
+    }
 
-      if (!task.splittable) {
-        if (remaining <= flexibleBudget) {
-          const interval = freeIntervals(occupied, bandStart, bandEnd)
-            .find((slot) => slot.end - slot.start >= remaining);
-          if (interval) {
-            const item = makeScheduleItem(task, date, interval.start, remaining);
-            items.push(item);
-            occupied.push({ start: item.start, end: item.end });
-            flexibleBudget -= remaining;
-            placed = remaining;
-            remaining = 0;
-          }
-        }
-      } else {
-        while (remaining > 0 && flexibleBudget >= TIME_STEP) {
-          const interval = freeIntervals(occupied, bandStart, bandEnd)
-            .find((slot) => slot.end - slot.start >= TIME_STEP);
-          if (!interval) break;
-          const available = Math.floor((interval.end - interval.start) / TIME_STEP) * TIME_STEP;
-          const budget = Math.floor(flexibleBudget / TIME_STEP) * TIME_STEP;
-          const chunk = Math.min(60, remaining, available, budget);
-          if (chunk < TIME_STEP) break;
-          const item = makeScheduleItem(task, date, interval.start, chunk);
-          items.push(item);
-          occupied.push({ start: item.start, end: item.end });
-          flexibleBudget -= chunk;
-          placed += chunk;
-          remaining -= chunk;
-        }
-      }
-
-      if (remaining > 0) {
-        let reason = placed ? `${durationText(placed)}만 배치하고 ${durationText(remaining)}이 남았습니다.` : '남은 시간에 배치할 수 없습니다.';
-        if (task.preferredTime !== 'anytime' && !placed) reason = `${LABELS.time[task.preferredTime]} 시간대에 빈칸이 부족합니다.`;
-        if (!task.splittable && !placed) reason = '연속된 시간이 부족합니다. 분할 가능을 켜보세요.';
-        unscheduled.push({ taskId: task.id, title: task.title, reason });
-      }
+    for (const plan of plans) {
+      const remaining = plan.total - plan.placed;
+      if (remaining <= 0) continue;
+      let reason = plan.placed ? `${durationText(plan.placed)}만 배치하고 ${durationText(remaining)}이 남았습니다.` : '남은 시간에 배치할 수 없습니다.';
+      if (plan.task.preferredTime !== 'anytime' && !plan.placed) reason = `${LABELS.time[plan.task.preferredTime]} 시간대에 빈칸이 부족합니다.`;
+      if (!plan.task.splittable && !plan.placed) reason = '연속된 시간이 부족합니다. 분할 가능을 켜보세요.';
+      unscheduled.push({ taskId: plan.task.id, title: plan.task.title, reason });
     }
 
     const mergedItems = mergeAdjacentTaskItems(items);
@@ -426,6 +523,7 @@
     mergedItems.forEach((item, index) => { item.order = index; });
     schedules[date] = {
       items: mergedItems, unscheduled, reservedBuffer,
+      algorithmVersion: SCHEDULE_ALGORITHM_VERSION,
       generatedAt: new Date().toISOString()
     };
     saveAll();
@@ -477,6 +575,7 @@
   }
 
   function renderToday() {
+    selectedScheduleId = null;
     const date = localDate();
     const schedule = schedules[date] || generateSchedule(date);
     const sorted = [...schedule.items].sort((a, b) => a.order - b.order);
@@ -487,7 +586,7 @@
     const focusMinutes = workItems.reduce((sum, item) => sum + item.durationMinutes, 0);
     const reservedMinutes = sorted.filter((item) => item.type === 'buffer').reduce((sum, item) => sum + item.durationMinutes, 0) || bufferMinutes();
 
-    $('#scheduleList').innerHTML = sorted.map(scheduleItemHTML).join('');
+    $('#scheduleList').innerHTML = scheduleTimelineHTML(sorted);
     $('#scheduleEmpty').hidden = workItems.length > 0;
     $('#scheduleList').hidden = workItems.length === 0;
     $('#scheduledCount').textContent = `${activeWork}개`;
@@ -502,25 +601,92 @@
     $('#unscheduledCard').hidden = !unscheduled.length;
     $('#unscheduledList').innerHTML = unscheduled.map((entry) => `<div class="mini-item"><strong>${escapeHTML(entry.title)}</strong><span>${escapeHTML(entry.reason)}</span></div>`).join('');
     attachDragEvents();
+    requestAnimationFrame(updateCurrentTimeMarker);
+  }
+
+  function scheduleTimelineHTML(items) {
+    const chronological = [...items].sort((a, b) => a.start - b.start || a.end - b.end);
+    const parts = ['<div class="current-time-marker" id="currentTimeMarker" hidden><span id="currentTimeLabel"></span></div>'];
+    parts.push(scheduleDropZoneHTML(0, '일정 맨 앞에 놓기'));
+    chronological.forEach((item, index) => {
+      parts.push(scheduleItemHTML(item));
+      parts.push(scheduleDropZoneHTML(index + 1, index === chronological.length - 1 ? '일정 끝에 놓기' : '일정 사이에 놓기'));
+    });
+    return parts.join('');
+  }
+
+  function scheduleDropZoneHTML(index, label) {
+    return `<button class="schedule-drop-zone" type="button" tabindex="-1" data-insert-index="${index}" aria-label="${label}">
+      <span>${label}</span>
+    </button>`;
+  }
+
+  function updateCurrentTimeMarker() {
+    const marker = $('#currentTimeMarker');
+    if (!marker) return;
+    const clock = zonedClock();
+    if (clock.date !== localDate() || clock.minutes < dayStart() || clock.minutes > dayEnd()) {
+      marker.hidden = true;
+      return;
+    }
+    const timelineItems = $$('#scheduleList .schedule-item').sort((a, b) => Number(a.dataset.timeStart) - Number(b.dataset.timeStart));
+    if (!timelineItems.length) {
+      marker.hidden = true;
+      return;
+    }
+    const segment = timelineItems.find((entry) => {
+      const start = Number(entry.dataset.timeStart);
+      const end = Number(entry.dataset.timeEnd);
+      return clock.minutes >= start && clock.minutes <= end;
+    });
+    let top;
+    if (segment) {
+      const start = Number(segment.dataset.timeStart);
+      const end = Number(segment.dataset.timeEnd);
+      const ratio = end > start ? Math.max(0, Math.min(1, (clock.minutes - start) / (end - start))) : 0;
+      top = segment.offsetTop + segment.offsetHeight * ratio;
+    } else {
+      const previous = [...timelineItems].reverse().find((entry) => Number(entry.dataset.timeEnd) <= clock.minutes);
+      const next = timelineItems.find((entry) => Number(entry.dataset.timeStart) >= clock.minutes);
+      if (previous && next) {
+        const gapStart = Number(previous.dataset.timeEnd);
+        const gapEnd = Number(next.dataset.timeStart);
+        const ratio = gapEnd > gapStart ? (clock.minutes - gapStart) / (gapEnd - gapStart) : 0.5;
+        const previousBottom = previous.offsetTop + previous.offsetHeight;
+        top = previousBottom + (next.offsetTop - previousBottom) * Math.max(0, Math.min(1, ratio));
+      } else if (next) {
+        top = next.offsetTop;
+      } else {
+        const last = timelineItems[timelineItems.length - 1];
+        top = last.offsetTop + last.offsetHeight;
+      }
+    }
+    marker.style.top = `${top}px`;
+    marker.hidden = false;
+    $('#currentTimeLabel').textContent = clock.label;
+    const zoneText = currentTimeZoneLabel === currentTimeZone ? currentTimeZone : `${currentTimeZoneLabel} · ${currentTimeZone}`;
+    marker.title = `현재 시각 ${clock.label} · ${zoneText}`;
+    marker.setAttribute('aria-label', marker.title);
   }
 
   function scheduleItemHTML(item) {
     const task = item.taskId ? tasks.find((entry) => entry.id === item.taskId) : null;
     const classes = ['schedule-item', item.type, item.completed ? 'is-completed' : ''].filter(Boolean).join(' ');
-    const draggable = item.type === 'task' && !item.completed;
+    const draggable = isMovableScheduleItem(item);
     const subtitle = item.type === 'buffer'
       ? escapeHTML(item.description)
       : `${durationText(item.durationMinutes)} ${task?.splittable && item.type === 'task' ? '· 분할 업무' : ''}`;
     const badges = task ? `${task.importance === 'high' ? '<span class="badge high">중요</span>' : ''}${task.recurring ? `<span class="badge recurring">${escapeHTML(recurrenceSummary(task))}</span>` : ''}` : '';
-    const actions = item.type === 'buffer' ? '' : item.completed ? `
+    const dragControl = draggable ? `<button class="drag-handle" type="button" title="드래그하거나 방향키로 순서 변경" aria-label="${escapeHTML(item.title)} ${minutesToTime(item.start)} 순서 변경">⠿</button>` : '';
+    const actions = item.type === 'buffer' ? `<div class="schedule-actions">${dragControl}</div>` : item.completed ? `
       <div class="schedule-actions"><button class="icon-button" type="button" data-schedule-action="restore" data-id="${item.id}" title="완료 취소" aria-label="${escapeHTML(item.title)} 완료 취소">↶</button><span class="badge normal">완료됨</span></div>` : `
       <div class="schedule-actions">
         <button class="icon-button" type="button" data-schedule-action="edit" data-id="${item.id}" title="수정" aria-label="${escapeHTML(item.title)} 수정">✎</button>
         <button class="icon-button complete" type="button" data-schedule-action="complete" data-id="${item.id}" title="완료" aria-label="${escapeHTML(item.title)} 완료">✓</button>
         <button class="icon-button" type="button" data-schedule-action="postpone" data-id="${item.id}" title="내일로 미루기" aria-label="${escapeHTML(item.title)} 내일로 미루기">→</button>
-        ${draggable ? `<button class="drag-handle" type="button" title="드래그하거나 방향키로 순서 변경" aria-label="${escapeHTML(item.title)} 순서 변경">⠿</button>` : ''}
+        ${dragControl}
       </div>`;
-    return `<article class="${classes}" data-schedule-id="${item.id}" draggable="${draggable}">
+    return `<article class="${classes}" data-schedule-id="${item.id}" data-time-start="${item.start}" data-time-end="${item.end}" draggable="${draggable}">
       <div class="schedule-time"><strong>${minutesToTime(item.start)}</strong><small>${minutesToTime(item.end)}</small></div>
       <div class="schedule-bar"></div>
       <div class="schedule-main"><h3>${escapeHTML(item.title)}</h3><p>${subtitle}${badges}</p></div>
@@ -920,6 +1086,12 @@
   function attachDragEvents() {
     $$('.schedule-item[draggable="true"]').forEach((item) => {
       const handle = $('.drag-handle', item);
+      handle?.addEventListener('click', () => {
+        selectedScheduleId = selectedScheduleId === item.dataset.scheduleId ? null : item.dataset.scheduleId;
+        $$('.schedule-item').forEach((entry) => entry.classList.toggle('is-selected', entry.dataset.scheduleId === selectedScheduleId));
+        $$('.schedule-drop-zone').forEach((entry) => entry.classList.toggle('is-ready', Boolean(selectedScheduleId)));
+        showToast(selectedScheduleId ? '놓을 카드 사이 또는 일정 끝을 선택하세요.' : '시간 이동 선택을 취소했어요.');
+      });
       handle?.addEventListener('keydown', (event) => {
         if (!['ArrowUp', 'ArrowDown'].includes(event.key)) return;
         event.preventDefault();
@@ -929,13 +1101,16 @@
         const target = movableItems[targetIndex];
         if (target) reorderSchedule(item.dataset.scheduleId, target.dataset.scheduleId);
       });
-      item.addEventListener('dragstart', () => {
+      item.addEventListener('dragstart', (event) => {
         draggedScheduleId = item.dataset.scheduleId;
+        event.dataTransfer?.setData('text/plain', draggedScheduleId);
+        if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
         item.classList.add('is-dragging');
       });
       item.addEventListener('dragend', () => {
         item.classList.remove('is-dragging');
-        $$('.schedule-item').forEach((entry) => entry.classList.remove('drag-over'));
+        $$('.schedule-item, .schedule-drop-zone').forEach((entry) => entry.classList.remove('drag-over'));
+        draggedScheduleId = null;
       });
       item.addEventListener('dragover', (event) => {
         event.preventDefault();
@@ -945,16 +1120,37 @@
       item.addEventListener('drop', (event) => {
         event.preventDefault();
         item.classList.remove('drag-over');
-        reorderSchedule(draggedScheduleId, item.dataset.scheduleId);
+        const sourceId = draggedScheduleId || event.dataTransfer?.getData('text/plain');
+        reorderSchedule(sourceId, item.dataset.scheduleId);
+      });
+    });
+
+    $$('.schedule-drop-zone').forEach((zone) => {
+      zone.addEventListener('click', () => {
+        if (!selectedScheduleId) return;
+        const sourceId = selectedScheduleId;
+        selectedScheduleId = null;
+        moveScheduleToPosition(sourceId, Number(zone.dataset.insertIndex));
+      });
+      zone.addEventListener('dragover', (event) => {
+        event.preventDefault();
+        if (draggedScheduleId) zone.classList.add('drag-over');
+      });
+      zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+      zone.addEventListener('drop', (event) => {
+        event.preventDefault();
+        zone.classList.remove('drag-over');
+        const sourceId = draggedScheduleId || event.dataTransfer?.getData('text/plain');
+        moveScheduleToPosition(sourceId, Number(zone.dataset.insertIndex));
       });
     });
   }
 
   function reflowScheduleAfterReorder(date, orderedItems) {
     const anchoredItems = orderedItems
-      .filter((item) => item.type === 'fixed' || item.completed)
+      .filter((item) => !isMovableScheduleItem(item))
       .map((item) => ({ ...item }));
-    const movableTasks = orderedItems.filter((item) => item.type === 'task' && !item.completed);
+    const movableItems = orderedItems.filter(isMovableScheduleItem);
     const bufferTotal = orderedItems
       .filter((item) => item.type === 'buffer')
       .reduce((sum, item) => sum + item.durationMinutes, 0);
@@ -962,29 +1158,51 @@
     const reflowed = [...anchoredItems];
     let cursor = dayStart();
 
-    for (const item of movableTasks) {
+    for (let index = 0; index < movableItems.length; index += 1) {
+      const item = movableItems[index];
       const duration = item.durationMinutes;
-      const interval = freeIntervals(occupied, cursor, dayEnd())
-        .find((slot) => slot.end - slot.start >= duration);
-      if (!interval) return null;
+      const target = distributedTarget(dayStart(), dayEnd(), index, movableItems.length, false);
+      const start = closestAvailableStart(occupied, dayStart(), dayEnd(), duration, target, cursor);
+      if (start === null) return null;
 
       const updated = {
         ...item,
-        start: interval.start,
-        end: interval.start + duration
+        start,
+        end: start + duration
       };
       reflowed.push(updated);
       occupied.push({ start: updated.start, end: updated.end });
       cursor = updated.end;
     }
 
-    const reservedBuffer = reserveBuffers(date, occupied, reflowed, bufferTotal);
-    if (reservedBuffer < bufferTotal) return null;
-
     const mergedItems = mergeAdjacentTaskItems(reflowed);
     mergedItems.sort((a, b) => a.start - b.start || a.end - b.end);
     mergedItems.forEach((item, index) => { item.order = index; });
-    return { items: mergedItems, reservedBuffer };
+    return { items: mergedItems, reservedBuffer: bufferTotal };
+  }
+
+  function moveScheduleToPosition(id, insertIndex) {
+    const date = localDate();
+    const schedule = schedules[date];
+    if (!schedule) return;
+    const ordered = [...schedule.items].sort((a, b) => a.order - b.order);
+    const fromIndex = ordered.findIndex((item) => item.id === id);
+    if (fromIndex < 0 || !isMovableScheduleItem(ordered[fromIndex])) return;
+    const [moved] = ordered.splice(fromIndex, 1);
+    const adjustedIndex = Math.max(0, Math.min(ordered.length, insertIndex > fromIndex ? insertIndex - 1 : insertIndex));
+    ordered.splice(adjustedIndex, 0, moved);
+    const reflowed = reflowScheduleAfterReorder(date, ordered);
+    if (!reflowed) {
+      showToast('고정 일정 사이의 시간이 부족해 이 위치로 옮길 수 없어요.');
+      return;
+    }
+    schedule.items = reflowed.items;
+    schedule.reservedBuffer = reflowed.reservedBuffer;
+    schedule.algorithmVersion = SCHEDULE_ALGORITHM_VERSION;
+    schedule.reorderedAt = new Date().toISOString();
+    saveAll();
+    renderToday();
+    showToast('빈 시간을 자동으로 계산해 다시 배치했어요.');
   }
 
   function reorderSchedule(fromId, toId) {
@@ -996,7 +1214,7 @@
     const fromIndex = ordered.findIndex((item) => item.id === fromId);
     const toIndex = ordered.findIndex((item) => item.id === toId);
     if (fromIndex < 0 || toIndex < 0) return;
-    if (ordered[fromIndex].type !== 'task' || ordered[fromIndex].completed || ordered[toIndex].type !== 'task' || ordered[toIndex].completed) return;
+    if (!isMovableScheduleItem(ordered[fromIndex]) || !isMovableScheduleItem(ordered[toIndex])) return;
     const [moved] = ordered.splice(fromIndex, 1);
     ordered.splice(toIndex, 0, moved);
     const reflowed = reflowScheduleAfterReorder(date, ordered);
@@ -1006,6 +1224,7 @@
     }
     schedule.items = reflowed.items;
     schedule.reservedBuffer = reflowed.reservedBuffer;
+    schedule.algorithmVersion = SCHEDULE_ALGORITHM_VERSION;
     schedule.reorderedAt = new Date().toISOString();
     saveAll();
     renderToday();
@@ -1418,9 +1637,13 @@
     populateRecurrenceControls();
     resetForm();
     applySettingsText();
-    if (!schedules[localDate()]) generateSchedule(localDate());
+    const todaySchedule = schedules[localDate()];
+    if (!todaySchedule || todaySchedule.algorithmVersion !== SCHEDULE_ALGORITHM_VERSION) generateSchedule(localDate());
     bindEvents();
     renderAll();
+    resolveTimeZoneFromIp();
+    window.addEventListener('resize', updateCurrentTimeMarker);
+    setInterval(updateCurrentTimeMarker, 30000);
   }
 
   init();
