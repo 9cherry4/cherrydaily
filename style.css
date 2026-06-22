@@ -104,8 +104,10 @@ button, .brand { -webkit-tap-highlight-color: transparent; }
 .section-heading.compact { margin-bottom: 15px; }
 .section-heading h2 { margin: 0; font-family: var(--app-font); font-size: 20px; font-weight: 600; letter-spacing: -.03em; }
 .section-heading p { margin: 6px 0 0; color: var(--muted); font-size: 11px; }
+.schedule-meta { display: grid; justify-items: end; gap: 8px; }
 .legend { display: flex; gap: 14px; color: var(--muted); font-size: 10px; }
 .legend span { display: flex; align-items: center; gap: 5px; }
+.timezone-display { padding: 4px 8px; border: 1px solid #cdddea; border-radius: 999px; color: #527a9b; background: #f4f8fb; font-size: 9px; font-variant-numeric: tabular-nums; }
 .dot { width: 7px; height: 7px; border-radius: 50%; }
 .dot.fixed { background: var(--coral); }.dot.task { background: var(--green); }.dot.buffer { background: var(--blue); }
 

@@ -5,8 +5,7 @@
   const DEFAULT_DAY_END = 21 * 60;
   const DEFAULT_DAY_MINUTES = DEFAULT_DAY_END - DEFAULT_DAY_START;
   const TIME_STEP = 15;
-  const SCHEDULE_ALGORITHM_VERSION = 2;
-  const IP_TIMEZONE_ENDPOINT = 'https://ipwho.is/';
+  const SCHEDULE_ALGORITHM_VERSION = 5;
   const DEFAULT_BUFFER_MINUTES = Math.round((DEFAULT_DAY_MINUTES * 0.2) / TIME_STEP) * TIME_STEP;
 
   const KEYS = {
@@ -52,7 +51,6 @@
   let historyDate = addDays(localDate(), -1);
   let historyMode = 'day';
   let currentTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Seoul';
-  let currentTimeZoneLabel = currentTimeZone;
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -120,26 +118,6 @@
       const minute = String(date.getMinutes()).padStart(2, '0');
       return { date: localDate(date), minutes: date.getHours() * 60 + date.getMinutes(), label: `${hour}:${minute}` };
     }
-  }
-
-  async function resolveTimeZoneFromIp() {
-    try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 4000);
-      const response = await fetch(IP_TIMEZONE_ENDPOINT, { signal: controller.signal, cache: 'no-store' });
-      clearTimeout(timeout);
-      if (!response.ok) throw new Error('IP timezone lookup failed');
-      const data = await response.json();
-      const zone = typeof data.timezone === 'string' ? data.timezone : data.timezone?.id;
-      if (!data.success || !zone) throw new Error('IP timezone unavailable');
-      new Intl.DateTimeFormat('ko-KR', { timeZone: zone }).format(new Date());
-      currentTimeZone = zone;
-      currentTimeZoneLabel = [data.city, data.region, data.country].filter(Boolean).join(', ') || zone;
-    } catch {
-      currentTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Seoul';
-      currentTimeZoneLabel = currentTimeZone;
-    }
-    updateCurrentTimeMarker();
   }
 
   function addDays(dateString, amount) {
@@ -215,6 +193,19 @@
     }
     const importanceScore = { high: 350, normal: 140, low: 0 }[task.importance] || 0;
     return deadlineScore + importanceScore + (task.postponedCount || 0) * 15;
+  }
+
+  function earlyPlacementWeight(task, date = localDate()) {
+    let weight = { high: 0.22, normal: 0.08, low: 0 }[task.importance] || 0;
+    if (task.deadline) {
+      const days = daysUntil(task.deadline, date);
+      if (days <= 0) weight += 0.32;
+      else if (days <= 1) weight += 0.26;
+      else if (days <= 3) weight += 0.18;
+      else if (days <= 7) weight += 0.08;
+    }
+    if ((task.postponedCount || 0) > 0) weight += 0.05;
+    return Math.min(0.55, weight);
   }
 
   function isCompletedForDate(task, date) {
@@ -320,62 +311,54 @@
     return Boolean(item) && !item.completed && (item.type === 'task' || item.type === 'buffer');
   }
 
-  function reserveBuffers(date, occupied, items, requestedMinutes = bufferMinutes()) {
-    const bandsMap = timeBands();
-    const bands = [bandsMap.morning, bandsMap.afternoon, bandsMap.evening];
-    const totalBuffer = Math.max(0, Math.floor(requestedMinutes / TIME_STEP) * TIME_STEP);
-    const base = Math.floor(totalBuffer / 3 / TIME_STEP) * TIME_STEP;
-    const bufferPlan = [base, base, base];
-    let bufferRemainder = totalBuffer - base * 3;
-    for (let index = 1; bufferRemainder > 0; index = (index + 1) % 3) {
-      bufferPlan[index] += TIME_STEP;
-      bufferRemainder -= TIME_STEP;
+  function bufferChunkPlan(totalBuffer, workloadRatio) {
+    const chunks = [];
+    let remaining = totalBuffer;
+    const [minimum, maximum] = workloadRatio <= 0.35 ? [60, 120] : workloadRatio <= 0.65 ? [30, 60] : [15, 15];
+    while (remaining > 0) {
+      if (remaining <= maximum) {
+        chunks.push(remaining);
+        break;
+      }
+      const candidates = [];
+      for (let duration = minimum; duration <= maximum; duration += TIME_STEP) {
+        const rest = remaining - duration;
+        if (rest === 0 || rest >= minimum) candidates.push(duration);
+      }
+      const duration = candidates.length
+        ? candidates[Math.floor(Math.random() * candidates.length)]
+        : Math.min(maximum, remaining);
+      chunks.push(duration);
+      remaining -= duration;
     }
+    return chunks;
+  }
+
+  function reserveBuffers(date, occupied, items, requestedMinutes = bufferMinutes(), workloadRatio = 1) {
+    const totalBuffer = Math.max(0, Math.floor(requestedMinutes / TIME_STEP) * TIME_STEP);
+    const chunks = bufferChunkPlan(totalBuffer, workloadRatio);
     let reserved = 0;
 
-    for (let index = 0; index < bands.length; index += 1) {
-      const [bandStart, bandEnd] = bands[index];
-      let needed = bufferPlan[index];
-      const free = freeIntervals(occupied, bandStart, bandEnd).reverse();
-      for (const interval of free) {
-        if (needed <= 0) break;
-        const available = Math.floor((interval.end - interval.start) / TIME_STEP) * TIME_STEP;
-        const duration = Math.min(needed, available);
-        if (duration < TIME_STEP) continue;
-        const start = interval.end - duration;
-        const buffer = {
-          id: uid('buffer'), taskId: null, date, type: 'buffer',
-          title: '여유 시간', description: '예상 밖의 일과 회복을 위한 빈칸',
-          start, end: interval.end, durationMinutes: duration,
-          completed: false, order: 0
-        };
-        items.push(buffer);
-        occupied.push({ start: buffer.start, end: buffer.end });
-        reserved += duration;
-        needed -= duration;
+    for (let index = 0; index < chunks.length; index += 1) {
+      let duration = chunks[index];
+      const target = distributedTarget(dayStart(), dayEnd(), index, chunks.length, true);
+      let start = closestAvailableStart(occupied, dayStart(), dayEnd(), duration, target);
+      while (start === null && duration > TIME_STEP) {
+        duration -= TIME_STEP;
+        start = closestAvailableStart(occupied, dayStart(), dayEnd(), duration, target);
       }
-    }
-
-    let remaining = totalBuffer - reserved;
-    if (remaining > 0) {
-      const free = freeIntervals(occupied, dayStart(), dayEnd()).reverse();
-      for (const interval of free) {
-        if (remaining <= 0) break;
-        const available = Math.floor((interval.end - interval.start) / TIME_STEP) * TIME_STEP;
-        const duration = Math.min(remaining, available);
-        if (duration < TIME_STEP) continue;
-        const start = interval.end - duration;
-        const buffer = {
-          id: uid('buffer'), taskId: null, date, type: 'buffer',
-          title: '여유 시간', description: '예상 밖의 일과 회복을 위한 빈칸',
-          start, end: interval.end, durationMinutes: duration,
-          completed: false, order: 0
-        };
-        items.push(buffer);
-        occupied.push({ start: buffer.start, end: buffer.end });
-        reserved += duration;
-        remaining -= duration;
-      }
+      if (start === null) continue;
+      const buffer = {
+        id: uid('buffer'), taskId: null, date, type: 'buffer',
+        title: '여유 시간', description: '예상 밖의 일과 회복을 위한 빈칸',
+        start, end: start + duration, durationMinutes: duration,
+        completed: false, order: 0
+      };
+      items.push(buffer);
+      occupied.push({ start: buffer.start, end: buffer.end });
+      reserved += duration;
+      const unplaced = chunks[index] - duration;
+      if (unplaced >= TIME_STEP) chunks.splice(index + 1, 0, unplaced);
     }
     return reserved;
   }
@@ -480,7 +463,11 @@
       }
     }
 
-    const reservedBuffer = reserveBuffers(date, occupied, items);
+    const flexibleDemand = candidates
+      .filter((task) => !task.isFixed)
+      .reduce((sum, task) => sum + remainingMinutes(task, date), 0);
+    const workloadRatio = Math.min(1, (fixedMinutes + flexibleDemand) / Math.max(TIME_STEP, workLimit()));
+    const reservedBuffer = reserveBuffers(date, occupied, items, bufferMinutes(), workloadRatio);
     const flexibleBudget = Math.max(0, workLimit() - fixedMinutes);
     const flexibleTasks = candidates
       .filter((task) => !task.isFixed)
@@ -499,7 +486,9 @@
       const key = task.preferredTime || 'anytime';
       const [bandStart, bandEnd] = bandsForDay[key] || bandsForDay.anytime;
       const groupIndex = groupIndexes[key] || 0;
-      const target = distributedTarget(bandStart, bandEnd, groupIndex, groupTotals[key], true);
+      const randomTarget = distributedTarget(bandStart, bandEnd, groupIndex, groupTotals[key], true);
+      const earlyWeight = earlyPlacementWeight(task, date);
+      const target = bandStart + (randomTarget - bandStart) * (1 - earlyWeight);
       groupIndexes[key] = groupIndex + 1;
       const start = closestAvailableStart(occupied, bandStart, bandEnd, unit.duration, target);
       if (start === null) continue;
@@ -535,12 +524,12 @@
     const merged = [];
     for (const item of sorted) {
       const previous = merged[merged.length - 1];
-      const joinsPrevious = previous
-        && item.type === 'task'
-        && previous.type === 'task'
+      const joinsTask = item.type === 'task'
+        && previous?.type === 'task'
         && item.taskId === previous.taskId
-        && item.completed === previous.completed
-        && previous.end === item.start;
+        && item.completed === previous.completed;
+      const joinsBuffer = item.type === 'buffer' && previous?.type === 'buffer';
+      const joinsPrevious = previous && previous.end === item.start && (joinsTask || joinsBuffer);
       if (joinsPrevious) {
         previous.end = item.end;
         previous.durationMinutes += item.durationMinutes;
@@ -664,8 +653,7 @@
     marker.style.top = `${top}px`;
     marker.hidden = false;
     $('#currentTimeLabel').textContent = clock.label;
-    const zoneText = currentTimeZoneLabel === currentTimeZone ? currentTimeZone : `${currentTimeZoneLabel} · ${currentTimeZone}`;
-    marker.title = `현재 시각 ${clock.label} · ${zoneText}`;
+    marker.title = `현재 시각 ${clock.label} · ${currentTimeZone}`;
     marker.setAttribute('aria-label', marker.title);
   }
 
@@ -1641,7 +1629,7 @@
     if (!todaySchedule || todaySchedule.algorithmVersion !== SCHEDULE_ALGORITHM_VERSION) generateSchedule(localDate());
     bindEvents();
     renderAll();
-    resolveTimeZoneFromIp();
+    $('#timezoneDisplay').textContent = currentTimeZone;
     window.addEventListener('resize', updateCurrentTimeMarker);
     setInterval(updateCurrentTimeMarker, 30000);
   }
