@@ -272,10 +272,10 @@
     };
   }
 
-  function reserveBuffers(date, occupied, items) {
+  function reserveBuffers(date, occupied, items, requestedMinutes = bufferMinutes()) {
     const bandsMap = timeBands();
     const bands = [bandsMap.morning, bandsMap.afternoon, bandsMap.evening];
-    const totalBuffer = bufferMinutes();
+    const totalBuffer = Math.max(0, Math.floor(requestedMinutes / TIME_STEP) * TIME_STEP);
     const base = Math.floor(totalBuffer / 3 / TIME_STEP) * TIME_STEP;
     const bufferPlan = [base, base, base];
     let bufferRemainder = totalBuffer - base * 3;
@@ -305,6 +305,28 @@
         occupied.push({ start: buffer.start, end: buffer.end });
         reserved += duration;
         needed -= duration;
+      }
+    }
+
+    let remaining = totalBuffer - reserved;
+    if (remaining > 0) {
+      const free = freeIntervals(occupied, dayStart(), dayEnd()).reverse();
+      for (const interval of free) {
+        if (remaining <= 0) break;
+        const available = Math.floor((interval.end - interval.start) / TIME_STEP) * TIME_STEP;
+        const duration = Math.min(remaining, available);
+        if (duration < TIME_STEP) continue;
+        const start = interval.end - duration;
+        const buffer = {
+          id: uid('buffer'), taskId: null, date, type: 'buffer',
+          title: '여유 시간', description: '예상 밖의 일과 회복을 위한 빈칸',
+          start, end: interval.end, durationMinutes: duration,
+          completed: false, order: 0
+        };
+        items.push(buffer);
+        occupied.push({ start: buffer.start, end: buffer.end });
+        reserved += duration;
+        remaining -= duration;
       }
     }
     return reserved;
@@ -496,7 +518,7 @@
         <button class="icon-button" type="button" data-schedule-action="edit" data-id="${item.id}" title="수정" aria-label="${escapeHTML(item.title)} 수정">✎</button>
         <button class="icon-button complete" type="button" data-schedule-action="complete" data-id="${item.id}" title="완료" aria-label="${escapeHTML(item.title)} 완료">✓</button>
         <button class="icon-button" type="button" data-schedule-action="postpone" data-id="${item.id}" title="내일로 미루기" aria-label="${escapeHTML(item.title)} 내일로 미루기">→</button>
-        ${draggable ? '<span class="drag-handle" title="드래그해서 순서 변경">⠿</span>' : ''}
+        ${draggable ? `<button class="drag-handle" type="button" title="드래그하거나 방향키로 순서 변경" aria-label="${escapeHTML(item.title)} 순서 변경">⠿</button>` : ''}
       </div>`;
     return `<article class="${classes}" data-schedule-id="${item.id}" draggable="${draggable}">
       <div class="schedule-time"><strong>${minutesToTime(item.start)}</strong><small>${minutesToTime(item.end)}</small></div>
@@ -897,6 +919,16 @@
 
   function attachDragEvents() {
     $$('.schedule-item[draggable="true"]').forEach((item) => {
+      const handle = $('.drag-handle', item);
+      handle?.addEventListener('keydown', (event) => {
+        if (!['ArrowUp', 'ArrowDown'].includes(event.key)) return;
+        event.preventDefault();
+        const movableItems = $$('.schedule-item[draggable="true"]');
+        const currentIndex = movableItems.indexOf(item);
+        const targetIndex = currentIndex + (event.key === 'ArrowUp' ? -1 : 1);
+        const target = movableItems[targetIndex];
+        if (target) reorderSchedule(item.dataset.scheduleId, target.dataset.scheduleId);
+      });
       item.addEventListener('dragstart', () => {
         draggedScheduleId = item.dataset.scheduleId;
         item.classList.add('is-dragging');
@@ -918,19 +950,66 @@
     });
   }
 
+  function reflowScheduleAfterReorder(date, orderedItems) {
+    const anchoredItems = orderedItems
+      .filter((item) => item.type === 'fixed' || item.completed)
+      .map((item) => ({ ...item }));
+    const movableTasks = orderedItems.filter((item) => item.type === 'task' && !item.completed);
+    const bufferTotal = orderedItems
+      .filter((item) => item.type === 'buffer')
+      .reduce((sum, item) => sum + item.durationMinutes, 0);
+    const occupied = anchoredItems.map((item) => ({ start: item.start, end: item.end }));
+    const reflowed = [...anchoredItems];
+    let cursor = dayStart();
+
+    for (const item of movableTasks) {
+      const duration = item.durationMinutes;
+      const interval = freeIntervals(occupied, cursor, dayEnd())
+        .find((slot) => slot.end - slot.start >= duration);
+      if (!interval) return null;
+
+      const updated = {
+        ...item,
+        start: interval.start,
+        end: interval.start + duration
+      };
+      reflowed.push(updated);
+      occupied.push({ start: updated.start, end: updated.end });
+      cursor = updated.end;
+    }
+
+    const reservedBuffer = reserveBuffers(date, occupied, reflowed, bufferTotal);
+    if (reservedBuffer < bufferTotal) return null;
+
+    const mergedItems = mergeAdjacentTaskItems(reflowed);
+    mergedItems.sort((a, b) => a.start - b.start || a.end - b.end);
+    mergedItems.forEach((item, index) => { item.order = index; });
+    return { items: mergedItems, reservedBuffer };
+  }
+
   function reorderSchedule(fromId, toId) {
     if (!fromId || fromId === toId) return;
-    const schedule = schedules[localDate()];
+    const date = localDate();
+    const schedule = schedules[date];
+    if (!schedule) return;
     const ordered = [...schedule.items].sort((a, b) => a.order - b.order);
     const fromIndex = ordered.findIndex((item) => item.id === fromId);
     const toIndex = ordered.findIndex((item) => item.id === toId);
     if (fromIndex < 0 || toIndex < 0) return;
+    if (ordered[fromIndex].type !== 'task' || ordered[fromIndex].completed || ordered[toIndex].type !== 'task' || ordered[toIndex].completed) return;
     const [moved] = ordered.splice(fromIndex, 1);
     ordered.splice(toIndex, 0, moved);
-    ordered.forEach((item, index) => { item.order = index; });
+    const reflowed = reflowScheduleAfterReorder(date, ordered);
+    if (!reflowed) {
+      showToast('고정 일정 사이의 시간이 부족해 이 순서로 바꿀 수 없어요.');
+      return;
+    }
+    schedule.items = reflowed.items;
+    schedule.reservedBuffer = reflowed.reservedBuffer;
+    schedule.reorderedAt = new Date().toISOString();
     saveAll();
     renderToday();
-    showToast('실행 순서를 저장했어요. 고정 시간은 그대로 유지됩니다.');
+    showToast('순서에 맞춰 시간을 다시 배치했어요. 고정 일정은 그대로 유지됩니다.');
   }
 
   function showToast(message) {

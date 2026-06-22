@@ -138,7 +138,8 @@ button, .brand { -webkit-tap-highlight-color: transparent; }
 .schedule-item.buffer { background: #f3f8fa; }
 .schedule-item.buffer h3 { color: #547d94; }
 .schedule-item.buffer .schedule-actions { visibility: hidden; }
-.drag-handle { color: #b6bbb8; font-size: 16px; }
+.drag-handle { padding: 2px; border: 0; background: transparent; color: #b6bbb8; font-size: 16px; cursor: grab; }
+.drag-handle:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; border-radius: 5px; }
 
 .badge { display: inline-flex; align-items: center; min-height: 21px; padding: 3px 8px; border-radius: 999px; background: #eeeae2; color: #707875; font-size: 9px; font-weight: 700; }
 .badge.high { color: #426f99; background: var(--coral-soft); }
