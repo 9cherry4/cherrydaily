@@ -317,6 +317,9 @@ button, .brand { -webkit-tap-highlight-color: transparent; }
   .stat-card { padding: 12px 15px; }
   .schedule-card, #view-tasks .content-card, #view-completed .content-card, .settings-card, .task-form { padding: 22px 17px 26px; }
   .legend { display: none; }
+  .schedule-meta { width: 100%; justify-items: start; }
+  .current-time-marker span { display: none; }
+  .current-time-marker::before { left: 0; }
   .schedule-item { grid-template-columns: 62px 4px minmax(0, 1fr); gap: 9px; padding-right: 5px; }
   .schedule-actions { grid-column: 3; justify-content: flex-end; }
   .form-grid { grid-template-columns: 1fr; }

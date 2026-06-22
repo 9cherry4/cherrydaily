@@ -611,9 +611,11 @@
   }
 
   function updateCurrentTimeMarker() {
+    const clock = zonedClock();
+    const timezoneDisplay = $('#timezoneDisplay');
+    if (timezoneDisplay) timezoneDisplay.textContent = `${currentTimeZone} · ${clock.label}`;
     const marker = $('#currentTimeMarker');
     if (!marker) return;
-    const clock = zonedClock();
     if (clock.date !== localDate() || clock.minutes < dayStart() || clock.minutes > dayEnd()) {
       marker.hidden = true;
       return;
